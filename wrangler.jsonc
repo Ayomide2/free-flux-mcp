@@ -20,7 +20,8 @@
 			"/llms.txt",
 			"/robots.txt",
 			"/*.jsonld",
-			"/*.md"
+			"/*.md",
+            "/mcp" 
 		]
 	},
 	"ai": {
