@@ -44,6 +44,42 @@ import {
 
 const app = new Hono<{ Bindings: Env }>();
 
+// "Jen" — a voice clone created on Ayo's own MiniMax account (consent
+// confirmed for this project's use). Used as the default voice for
+// generate_narration; callers may override it with their own voice_id.
+const DEFAULT_NARRATION_VOICE_ID = "moss_audio_32186ec7-b449-11f1-80cc-aac30e71d302";
+
+// minimax/speech-2.8-turbo caps input at 10,000 characters per request.
+// Longer scripts are split on whitespace boundaries and synthesized as
+// separate chunks, then the resulting MP3 byte streams are concatenated.
+const MINIMAX_TEXT_LIMIT = 10_000;
+
+function chunkNarrationText(text: string, maxLen = MINIMAX_TEXT_LIMIT): string[] {
+	const chunks: string[] = [];
+	let rest = text.trim();
+	while (rest.length > maxLen) {
+		let cut = rest.lastIndexOf(" ", maxLen);
+		if (cut <= 0) cut = maxLen;
+		chunks.push(rest.slice(0, cut).trim());
+		rest = rest.slice(cut).trim();
+	}
+	if (rest.length > 0) chunks.push(rest);
+	return chunks;
+}
+
+// No Buffer/Node APIs on the default Workers runtime — build the base64
+// string manually, in chunks small enough to avoid blowing the call stack
+// on String.fromCharCode(...bytes) for a multi-megabyte audio file.
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+	const bytes = new Uint8Array(buffer);
+	let binary = "";
+	const chunkSize = 0x8000;
+	for (let i = 0; i < bytes.length; i += chunkSize) {
+		binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+	}
+	return btoa(binary);
+}
+
 app.onError((err, c) => {
 	console.error(`[Error] ${c.req.method} ${c.req.path}: ${err.message}`);
 	// Match the response type to the surface: text surfaces shouldn't get a
@@ -52,7 +88,19 @@ app.onError((err, c) => {
 		return c.text("Internal server error", 500);
 	}
 	return c.json({ error: "Internal server error" }, 500);
-});// --- MCP endpoint (Streamable HTTP, single POST endpoint) ------------------
+});
+
+// --- MCP endpoint (Streamable HTTP, single POST endpoint) ------------------
+//
+// Per the MCP Streamable HTTP transport, a syntactically valid JSON-RPC
+// request that the server understood always gets HTTP 200 — even when the
+// *result* is a JSON-RPC-level error (unknown method, unknown tool). A
+// non-2xx HTTP status is reserved for transport-level failures (the body
+// wasn't valid JSON at all). Most client SDKs treat any non-2xx response as
+// a hard transport failure and never look at the JSON-RPC body, so returning
+// 404/500 here — as earlier versions of this handler did — made every
+// unknown-method or failed-tool-call response invisible to the client.
+app.use("/mcp", cors());
 app.post("/mcp", async (c) => {
 	let body: any;
 	try {
@@ -98,14 +146,123 @@ app.post("/mcp", async (c) => {
 							required: ["prompt"],
 						},
 					},
+					{
+						name: "generate_narration",
+						description:
+							"Generates spoken narration audio (MP3) from a text script using the project's cloned voice. Scripts over 10,000 characters are automatically split into chunks and concatenated.",
+						inputSchema: {
+							type: "object",
+							properties: {
+								text: { type: "string", description: "The narration script to convert to speech." },
+								voice_id: {
+									type: "string",
+									description: "MiniMax voice ID to narrate with. Defaults to the project's 'Jen' voice clone.",
+								},
+								speed: { type: "number", description: "Speech speed, 0.5-2. Defaults to 1." },
+								emotion: {
+									type: "string",
+									enum: ["happy", "sad", "angry", "fearful", "disgusted", "surprised", "calm", "fluent"],
+									description: "Optional emotional tone for the narration.",
+								},
+							},
+							required: ["text"],
+						},
+					},
 				],
 			},
 		});
 	}
 
-	if (body.method === "tools/call" && body.params?.name === "generate_widescreen_drawing") {
+	if (body.method === "tools/call") {
+		const toolName = body.params?.name;
+
+		if (toolName !== "generate_widescreen_drawing" && toolName !== "generate_narration") {
+			return c.json({
+				jsonrpc: "2.0",
+				id: body.id,
+				error: { code: -32602, message: `Unknown tool: ${toolName}` },
+			});
+		}
+
+		if (toolName === "generate_narration") {
+			const script = body.params?.arguments?.text;
+			if (typeof script !== "string" || script.trim().length === 0) {
+				return c.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					error: { code: -32602, message: "Missing required argument: text" },
+				});
+			}
+
+			const voiceId =
+				typeof body.params?.arguments?.voice_id === "string"
+					? body.params.arguments.voice_id
+					: DEFAULT_NARRATION_VOICE_ID;
+			const speed = typeof body.params?.arguments?.speed === "number" ? body.params.arguments.speed : 1;
+			const emotion =
+				typeof body.params?.arguments?.emotion === "string" ? body.params.arguments.emotion : undefined;
+
+			try {
+				const chunks = chunkNarrationText(script);
+				const audioBuffers: ArrayBuffer[] = [];
+
+				for (const chunk of chunks) {
+					const aiResponse = await c.env.AI.run("minimax/speech-2.8-turbo", {
+						text: chunk,
+						voice_id: voiceId,
+						speed,
+						volume: 1,
+						pitch: 0,
+						format: "mp3",
+						...(emotion ? { emotion } : {}),
+					} as Parameters<Ai["run"]>[1]);
+
+					const audioUrl = (aiResponse as { audio: string }).audio;
+					const audioRes = await fetch(audioUrl);
+					if (!audioRes.ok) {
+						throw new Error(`Failed to fetch generated audio chunk (HTTP ${audioRes.status})`);
+					}
+					audioBuffers.push(await audioRes.arrayBuffer());
+				}
+
+				const totalLength = audioBuffers.reduce((sum, buf) => sum + buf.byteLength, 0);
+				const combined = new Uint8Array(totalLength);
+				let offset = 0;
+				for (const buf of audioBuffers) {
+					combined.set(new Uint8Array(buf), offset);
+					offset += buf.byteLength;
+				}
+
+				return c.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: {
+						content: [{ type: "audio", data: arrayBufferToBase64(combined.buffer), mimeType: "audio/mpeg" }],
+					},
+				});
+			} catch (err) {
+				console.error(`[MCP] generate_narration failed: ${(err as Error).message}`);
+				return c.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: {
+						isError: true,
+						content: [{ type: "text", text: `Narration generation failed: ${(err as Error).message}` }],
+					},
+				});
+			}
+		}
+
+		const userPrompt = body.params?.arguments?.prompt;
+		if (typeof userPrompt !== "string" || userPrompt.trim().length === 0) {
+			return c.json({
+				jsonrpc: "2.0",
+				id: body.id,
+				error: { code: -32602, message: "Missing required argument: prompt" },
+			});
+		}
+
 		try {
-			const userPrompt = body.params.arguments.prompt;
 			const stylizedPrompt = `${userPrompt}, simple clean drawing style, 2D vector graphic illustration, clean solid background, non-photorealistic art`;
 
 			const aiResponse = await c.env.AI.run("@cf/blackforestlabs/flux-1-schnell", {
@@ -125,17 +282,26 @@ app.post("/mcp", async (c) => {
 				},
 			});
 		} catch (err) {
-			return c.json(
-				{ jsonrpc: "2.0", id: body.id, error: { code: -32000, message: (err as Error).message } },
-				500,
-			);
+			// A failed tool execution is reported *inside* the result (isError),
+			// not as a JSON-RPC error — this is a normal outcome the calling
+			// model should see and can react to, not a protocol failure.
+			console.error(`[MCP] generate_widescreen_drawing failed: ${(err as Error).message}`);
+			return c.json({
+				jsonrpc: "2.0",
+				id: body.id,
+				result: {
+					isError: true,
+					content: [{ type: "text", text: `Image generation failed: ${(err as Error).message}` }],
+				},
+			});
 		}
 	}
 
-	return c.json(
-		{ jsonrpc: "2.0", id: body.id, error: { code: -32601, message: "Method not found" } },
-		404,
-	);
+	return c.json({
+		jsonrpc: "2.0",
+		id: body.id,
+		error: { code: -32601, message: `Method not found: ${body.method}` },
+	});
 });
 
 function originOf(url: string): string {
