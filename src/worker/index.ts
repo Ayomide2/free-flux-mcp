@@ -52,6 +52,91 @@ app.onError((err, c) => {
 		return c.text("Internal server error", 500);
 	}
 	return c.json({ error: "Internal server error" }, 500);
+});// --- MCP endpoint (Streamable HTTP, single POST endpoint) ------------------
+app.post("/mcp", async (c) => {
+	let body: any;
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json(
+			{ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
+			400,
+		);
+	}
+
+	if (body.method === "initialize") {
+		return c.json({
+			jsonrpc: "2.0",
+			id: body.id,
+			result: {
+				protocolVersion: "2025-06-18",
+				capabilities: { tools: {} },
+				serverInfo: { name: "flux-generator", version: "1.0.0" },
+			},
+		});
+	}
+
+	if (body.method === "notifications/initialized") {
+		return c.body(null, 202);
+	}
+
+	if (body.method === "tools/list") {
+		return c.json({
+			jsonrpc: "2.0",
+			id: body.id,
+			result: {
+				tools: [
+					{
+						name: "generate_widescreen_drawing",
+						description:
+							"Generates a simple 16:9 2D drawing illustration with a background using free credits.",
+						inputSchema: {
+							type: "object",
+							properties: {
+								prompt: { type: "string", description: "The core subject matter of the drawing." },
+							},
+							required: ["prompt"],
+						},
+					},
+				],
+			},
+		});
+	}
+
+	if (body.method === "tools/call" && body.params?.name === "generate_widescreen_drawing") {
+		try {
+			const userPrompt = body.params.arguments.prompt;
+			const stylizedPrompt = `${userPrompt}, simple clean drawing style, 2D vector graphic illustration, clean solid background, non-photorealistic art`;
+
+			const aiResponse = await c.env.AI.run("@cf/blackforestlabs/flux-1-schnell", {
+				prompt: stylizedPrompt,
+				width: 1024,
+				height: 576,
+				num_inference_steps: 4,
+			});
+
+			const imageBuffer = await aiResponse.arrayBuffer();
+			const base64Image = btoa(String.fromCharCode(...new Uint8Array(imageBuffer)));
+
+			return c.json({
+				jsonrpc: "2.0",
+				id: body.id,
+				result: {
+					content: [{ type: "image", data: base64Image, mimeType: "image/png" }],
+				},
+			});
+		} catch (err) {
+			return c.json(
+				{ jsonrpc: "2.0", id: body.id, error: { code: -32000, message: (err as Error).message } },
+				500,
+			);
+		}
+	}
+
+	return c.json(
+		{ jsonrpc: "2.0", id: body.id, error: { code: -32601, message: "Method not found" } },
+		404,
+	);
 });
 
 function originOf(url: string): string {
