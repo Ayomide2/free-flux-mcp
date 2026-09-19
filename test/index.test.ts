@@ -223,11 +223,13 @@ describe("Agent Visibility template", () => {
 			expect(res.status).toBe(202);
 		});
 
-		it("lists the generate_widescreen_drawing tool", async () => {
+		it("lists the generate_widescreen_drawing and generate_narration tools", async () => {
 			const res = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" });
 			expect(res.status).toBe(200);
 			const json = (await res.json()) as { result: { tools: Array<{ name: string }> } };
-			expect(json.result.tools.map((t) => t.name)).toContain("generate_widescreen_drawing");
+			const names = json.result.tools.map((t) => t.name);
+			expect(names).toContain("generate_widescreen_drawing");
+			expect(names).toContain("generate_narration");
 		});
 
 		// Unknown methods/tools and malformed calls are JSON-RPC-level errors,
@@ -265,6 +267,19 @@ describe("Agent Visibility template", () => {
 			const json = (await res.json()) as { error: { code: number; message: string } };
 			expect(json.error.code).toBe(-32602);
 			expect(json.error.message).toContain("prompt");
+		});
+
+		it("returns a JSON-RPC error (HTTP 200) when generate_narration's text argument is missing", async () => {
+			const res = await rpc({
+				jsonrpc: "2.0",
+				id: 7,
+				method: "tools/call",
+				params: { name: "generate_narration", arguments: {} },
+			});
+			expect(res.status).toBe(200);
+			const json = (await res.json()) as { error: { code: number; message: string } };
+			expect(json.error.code).toBe(-32602);
+			expect(json.error.message).toContain("text");
 		});
 
 		it("returns HTTP 400 with a JSON-RPC parse error for an invalid body", async () => {

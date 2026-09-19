@@ -144,15 +144,25 @@ at 100 KB, and the store holds up to 100 resources. Call `POST /api/refresh`
 | POST   | `/api/refresh`                        | Clear the enrichment cache _(requires `ADMIN_TOKEN`)_        |
 | GET    | `/.well-known/web-bot-auth/directory` | Trusted agent keys _(if enabled)_                            |
 | POST   | `/api/identity`                       | Verify a signed agent request _(if enabled)_                 |
-| POST   | `/mcp`                                | MCP server (Streamable HTTP, JSON-RPC) — image generation    |
+| POST   | `/mcp`                                | MCP server (Streamable HTTP, JSON-RPC) — image + audio generation |
 
-## MCP endpoint (image generation)
+## MCP endpoint (image + audio generation)
 
 `POST /mcp` is a separate, self-contained MCP server bolted onto this Worker.
-It exposes one tool, `generate_widescreen_drawing`, which renders a 16:9
-illustration with Workers AI's `@cf/blackforestlabs/flux-1-schnell` model and
-returns it as a base64 PNG. It shares no state with the content-store
-surfaces above — no KV, no enrichment.
+It exposes two independent tools that share nothing but the endpoint — no
+KV, no enrichment, and a failure or slowdown in one never affects the other:
+
+- **`generate_widescreen_drawing`** — renders a 16:9 illustration with
+  Workers AI's `@cf/blackforestlabs/flux-1-schnell` model and returns it as a
+  base64 PNG.
+- **`generate_narration`** — converts a text script into spoken narration
+  with Workers AI's `minimax/speech-2.8-turbo` model (a third-party,
+  zero-data-retention partner model — note the bare `minimax/...` id, no
+  `@cf/` prefix), returning a base64 MP3. Defaults to this project's cloned
+  "Jen" voice (`voice_id`), overridable per call. MiniMax caps input at
+  10,000 characters per request; longer scripts are automatically split on
+  whitespace boundaries into multiple calls and the resulting MP3 byte
+  streams are concatenated before being returned.
 
 ### How a client makes a request
 
@@ -178,12 +188,12 @@ curl -s https://<your-worker>.workers.dev/mcp \
   -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 
-# 3. Discover the tool
+# 3. Discover the tools
 curl -s https://<your-worker>.workers.dev/mcp \
   -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 
-# 4. Call it
+# 4a. Call the image tool
 curl -s https://<your-worker>.workers.dev/mcp \
   -H 'content-type: application/json' \
   -d '{
@@ -193,6 +203,19 @@ curl -s https://<your-worker>.workers.dev/mcp \
         "params":{
           "name":"generate_widescreen_drawing",
           "arguments":{"prompt":"a lighthouse at sunset"}
+        }
+      }'
+
+# 4b. Call the narration tool (independently — same endpoint, different tool name)
+curl -s https://<your-worker>.workers.dev/mcp \
+  -H 'content-type: application/json' \
+  -d '{
+        "jsonrpc":"2.0",
+        "id":4,
+        "method":"tools/call",
+        "params":{
+          "name":"generate_narration",
+          "arguments":{"text":"Welcome to the show."}
         }
       }'
 ```
@@ -209,11 +232,14 @@ A successful `tools/call` response looks like:
 }
 ```
 
+(`generate_narration` returns the same shape with `"type": "audio"`,
+`"mimeType": "audio/mpeg"`, and base64 MP3 bytes in `data`.)
+
 If generation itself fails (e.g. the model errors), the response is still
 `200 OK`, but `result.isError` is `true` and `result.content` carries a text
-explanation instead of an image — that's the MCP convention for a tool that
+explanation instead of media — that's the MCP convention for a tool that
 ran but failed, as opposed to a broken request. A malformed request (unknown
-method, unknown tool name, missing `prompt`) comes back as a JSON-RPC
+method, unknown tool name, missing `prompt`/`text`) comes back as a JSON-RPC
 `error` object, also on `200 OK`; only a request whose body isn't valid JSON
 at all gets a non-2xx (`400`) HTTP status. Client SDKs generally treat any
 non-2xx as a hard transport failure and never inspect the JSON-RPC body, so
@@ -245,9 +271,35 @@ or in a client that takes a JSON config (e.g. `claude_desktop_config.json` /
 }
 ```
 
-Once connected, ask the client to draw something — it will call
-`generate_widescreen_drawing` with your prompt and receive the image back
-over the same `/mcp` endpoint.
+Once connected, ask the client to draw something, or to narrate a script —
+it picks the tool that matches the request (`generate_widescreen_drawing` or
+`generate_narration`) and gets the result back over the same `/mcp`
+endpoint.
+
+### Routing image vs. audio requests from your own project
+
+If you're driving this from your own code instead of an MCP-native client —
+for example a project running on an EC2 instance under Claude Code — there
+is no separate routing layer to build. Both tools live on the one `/mcp`
+JSON-RPC endpoint; "routing" is just picking `params.name` per request:
+
+- Image request → `tools/call` with `name: "generate_widescreen_drawing"`.
+- Audio/script request → `tools/call` with `name: "generate_narration"`.
+
+They're independent calls against the same URL: a narration request never
+touches the image code path and vice versa, so a problem in one tool (a bad
+prompt, a MiniMax error) can't take down the other. To run this yourself:
+
+```bash
+git clone https://github.com/<you>/free-flux-mcp.git
+cd free-flux-mcp
+npm install
+npm run deploy   # or `npm run dev` to test locally first
+```
+
+Then point your EC2-hosted project at `https://<your-worker>.workers.dev/mcp`
+and dispatch on request type as above — no polling, no queue, just one
+`POST` per request.
 
 ## Caching
 
