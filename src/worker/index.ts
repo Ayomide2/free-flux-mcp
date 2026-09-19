@@ -115,8 +115,7 @@ app.post("/mcp", async (c) => {
 				num_inference_steps: 4,
 			});
 
-			const imageBuffer = await aiResponse.arrayBuffer();
-			const base64Image = btoa(String.fromCharCode(...new Uint8Array(imageBuffer)));
+			const base64Image = (aiResponse as { image: string }).image;
 
 			return c.json({
 				jsonrpc: "2.0",
