@@ -144,6 +144,162 @@ at 100 KB, and the store holds up to 100 resources. Call `POST /api/refresh`
 | POST   | `/api/refresh`                        | Clear the enrichment cache _(requires `ADMIN_TOKEN`)_        |
 | GET    | `/.well-known/web-bot-auth/directory` | Trusted agent keys _(if enabled)_                            |
 | POST   | `/api/identity`                       | Verify a signed agent request _(if enabled)_                 |
+| POST   | `/mcp`                                | MCP server (Streamable HTTP, JSON-RPC) — image + audio generation |
+
+## MCP endpoint (image + audio generation)
+
+`POST /mcp` is a separate, self-contained MCP server bolted onto this Worker.
+It exposes two independent tools that share nothing but the endpoint — no
+KV, no enrichment, and a failure or slowdown in one never affects the other:
+
+- **`generate_widescreen_drawing`** — renders a 16:9 illustration with
+  Workers AI's `@cf/blackforestlabs/flux-1-schnell` model and returns it as a
+  base64 PNG.
+- **`generate_narration`** — converts a text script into spoken narration
+  with Workers AI's `minimax/speech-2.8-turbo` model (a third-party,
+  zero-data-retention partner model — note the bare `minimax/...` id, no
+  `@cf/` prefix), returning a base64 MP3. Defaults to this project's cloned
+  "Jen" voice (`voice_id`), overridable per call. MiniMax caps input at
+  10,000 characters per request; longer scripts are automatically split on
+  whitespace boundaries into multiple calls and the resulting MP3 byte
+  streams are concatenated before being returned.
+
+### How a client makes a request
+
+The endpoint speaks the [MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http):
+every call is a single `POST /mcp` with a JSON-RPC 2.0 body, and the Worker
+answers with a single JSON-RPC response (no SSE stream). A session always
+follows the same three steps:
+
+1. **`initialize`** — handshake, returns server info and capabilities.
+2. **`notifications/initialized`** — a notification (no `id`, no response
+   body expected) telling the server the client is ready. The Worker replies
+   `202 Accepted` with an empty body.
+3. **`tools/list`** and **`tools/call`** — discover and invoke the tool.
+
+```bash
+# 1. Initialize
+curl -s https://<your-worker>.workers.dev/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+
+# 2. Tell the server you're ready (fire-and-forget notification)
+curl -s https://<your-worker>.workers.dev/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+# 3. Discover the tools
+curl -s https://<your-worker>.workers.dev/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+
+# 4a. Call the image tool
+curl -s https://<your-worker>.workers.dev/mcp \
+  -H 'content-type: application/json' \
+  -d '{
+        "jsonrpc":"2.0",
+        "id":3,
+        "method":"tools/call",
+        "params":{
+          "name":"generate_widescreen_drawing",
+          "arguments":{"prompt":"a lighthouse at sunset"}
+        }
+      }'
+
+# 4b. Call the narration tool (independently — same endpoint, different tool name)
+curl -s https://<your-worker>.workers.dev/mcp \
+  -H 'content-type: application/json' \
+  -d '{
+        "jsonrpc":"2.0",
+        "id":4,
+        "method":"tools/call",
+        "params":{
+          "name":"generate_narration",
+          "arguments":{"text":"Welcome to the show."}
+        }
+      }'
+```
+
+A successful `tools/call` response looks like:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [{ "type": "image", "data": "<base64 PNG>", "mimeType": "image/png" }]
+  }
+}
+```
+
+(`generate_narration` returns the same shape with `"type": "audio"`,
+`"mimeType": "audio/mpeg"`, and base64 MP3 bytes in `data`.)
+
+If generation itself fails (e.g. the model errors), the response is still
+`200 OK`, but `result.isError` is `true` and `result.content` carries a text
+explanation instead of media — that's the MCP convention for a tool that
+ran but failed, as opposed to a broken request. A malformed request (unknown
+method, unknown tool name, missing `prompt`/`text`) comes back as a JSON-RPC
+`error` object, also on `200 OK`; only a request whose body isn't valid JSON
+at all gets a non-2xx (`400`) HTTP status. Client SDKs generally treat any
+non-2xx as a hard transport failure and never inspect the JSON-RPC body, so
+this distinction is what keeps ordinary tool errors visible to the caller
+instead of surfacing as an opaque connection failure.
+
+### Configuring an MCP client/session
+
+Most MCP hosts (Claude Desktop, Claude Code, other Streamable-HTTP-capable
+clients) just need the URL — they run the `initialize` → `tools/list` →
+`tools/call` sequence above automatically once connected. For example, in
+Claude Code:
+
+```bash
+claude mcp add --transport http free-flux-mcp https://<your-worker>.workers.dev/mcp
+```
+
+or in a client that takes a JSON config (e.g. `claude_desktop_config.json` /
+`.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "free-flux-mcp": {
+      "type": "http",
+      "url": "https://<your-worker>.workers.dev/mcp"
+    }
+  }
+}
+```
+
+Once connected, ask the client to draw something, or to narrate a script —
+it picks the tool that matches the request (`generate_widescreen_drawing` or
+`generate_narration`) and gets the result back over the same `/mcp`
+endpoint.
+
+### Routing image vs. audio requests from your own project
+
+If you're driving this from your own code instead of an MCP-native client —
+for example a project running on an EC2 instance under Claude Code — there
+is no separate routing layer to build. Both tools live on the one `/mcp`
+JSON-RPC endpoint; "routing" is just picking `params.name` per request:
+
+- Image request → `tools/call` with `name: "generate_widescreen_drawing"`.
+- Audio/script request → `tools/call` with `name: "generate_narration"`.
+
+They're independent calls against the same URL: a narration request never
+touches the image code path and vice versa, so a problem in one tool (a bad
+prompt, a MiniMax error) can't take down the other. To run this yourself:
+
+```bash
+git clone https://github.com/<you>/free-flux-mcp.git
+cd free-flux-mcp
+npm install
+npm run deploy   # or `npm run dev` to test locally first
+```
+
+Then point your EC2-hosted project at `https://<your-worker>.workers.dev/mcp`
+and dispatch on request type as above — no polling, no queue, just one
+`POST` per request.
 
 ## Caching
 
