@@ -108,7 +108,7 @@ app.post("/mcp", async (c) => {
 			const userPrompt = body.params.arguments.prompt;
 			const stylizedPrompt = `${userPrompt}, simple clean drawing style, 2D vector graphic illustration, clean solid background, non-photorealistic art`;
 
-			const aiResponse = await c.env.AI.run("@cf/blackforestlabs/flux-1-schnell", {
+			const aiResponse = await c.env.AI.run("@cf/black-forest-labs/flux-1-schnell", {
 				prompt: stylizedPrompt,
 				width: 1024,
 				height: 576,
