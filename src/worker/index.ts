@@ -52,7 +52,19 @@ app.onError((err, c) => {
 		return c.text("Internal server error", 500);
 	}
 	return c.json({ error: "Internal server error" }, 500);
-});// --- MCP endpoint (Streamable HTTP, single POST endpoint) ------------------
+});
+
+// --- MCP endpoint (Streamable HTTP, single POST endpoint) ------------------
+//
+// Per the MCP Streamable HTTP transport, a syntactically valid JSON-RPC
+// request that the server understood always gets HTTP 200 — even when the
+// *result* is a JSON-RPC-level error (unknown method, unknown tool). A
+// non-2xx HTTP status is reserved for transport-level failures (the body
+// wasn't valid JSON at all). Most client SDKs treat any non-2xx response as
+// a hard transport failure and never look at the JSON-RPC body, so returning
+// 404/500 here — as earlier versions of this handler did — made every
+// unknown-method or failed-tool-call response invisible to the client.
+app.use("/mcp", cors());
 app.post("/mcp", async (c) => {
 	let body: any;
 	try {
@@ -103,9 +115,25 @@ app.post("/mcp", async (c) => {
 		});
 	}
 
-	if (body.method === "tools/call" && body.params?.name === "generate_widescreen_drawing") {
+	if (body.method === "tools/call") {
+		if (body.params?.name !== "generate_widescreen_drawing") {
+			return c.json({
+				jsonrpc: "2.0",
+				id: body.id,
+				error: { code: -32602, message: `Unknown tool: ${body.params?.name}` },
+			});
+		}
+
+		const userPrompt = body.params?.arguments?.prompt;
+		if (typeof userPrompt !== "string" || userPrompt.trim().length === 0) {
+			return c.json({
+				jsonrpc: "2.0",
+				id: body.id,
+				error: { code: -32602, message: "Missing required argument: prompt" },
+			});
+		}
+
 		try {
-			const userPrompt = body.params.arguments.prompt;
 			const stylizedPrompt = `${userPrompt}, simple clean drawing style, 2D vector graphic illustration, clean solid background, non-photorealistic art`;
 
 			const aiResponse = await c.env.AI.run("@cf/blackforestlabs/flux-1-schnell", {
@@ -125,17 +153,26 @@ app.post("/mcp", async (c) => {
 				},
 			});
 		} catch (err) {
-			return c.json(
-				{ jsonrpc: "2.0", id: body.id, error: { code: -32000, message: (err as Error).message } },
-				500,
-			);
+			// A failed tool execution is reported *inside* the result (isError),
+			// not as a JSON-RPC error — this is a normal outcome the calling
+			// model should see and can react to, not a protocol failure.
+			console.error(`[MCP] generate_widescreen_drawing failed: ${(err as Error).message}`);
+			return c.json({
+				jsonrpc: "2.0",
+				id: body.id,
+				result: {
+					isError: true,
+					content: [{ type: "text", text: `Image generation failed: ${(err as Error).message}` }],
+				},
+			});
 		}
 	}
 
-	return c.json(
-		{ jsonrpc: "2.0", id: body.id, error: { code: -32601, message: "Method not found" } },
-		404,
-	);
+	return c.json({
+		jsonrpc: "2.0",
+		id: body.id,
+		error: { code: -32601, message: `Method not found: ${body.method}` },
+	});
 });
 
 function originOf(url: string): string {

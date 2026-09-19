@@ -144,6 +144,110 @@ at 100 KB, and the store holds up to 100 resources. Call `POST /api/refresh`
 | POST   | `/api/refresh`                        | Clear the enrichment cache _(requires `ADMIN_TOKEN`)_        |
 | GET    | `/.well-known/web-bot-auth/directory` | Trusted agent keys _(if enabled)_                            |
 | POST   | `/api/identity`                       | Verify a signed agent request _(if enabled)_                 |
+| POST   | `/mcp`                                | MCP server (Streamable HTTP, JSON-RPC) — image generation    |
+
+## MCP endpoint (image generation)
+
+`POST /mcp` is a separate, self-contained MCP server bolted onto this Worker.
+It exposes one tool, `generate_widescreen_drawing`, which renders a 16:9
+illustration with Workers AI's `@cf/blackforestlabs/flux-1-schnell` model and
+returns it as a base64 PNG. It shares no state with the content-store
+surfaces above — no KV, no enrichment.
+
+### How a client makes a request
+
+The endpoint speaks the [MCP Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http):
+every call is a single `POST /mcp` with a JSON-RPC 2.0 body, and the Worker
+answers with a single JSON-RPC response (no SSE stream). A session always
+follows the same three steps:
+
+1. **`initialize`** — handshake, returns server info and capabilities.
+2. **`notifications/initialized`** — a notification (no `id`, no response
+   body expected) telling the server the client is ready. The Worker replies
+   `202 Accepted` with an empty body.
+3. **`tools/list`** and **`tools/call`** — discover and invoke the tool.
+
+```bash
+# 1. Initialize
+curl -s https://<your-worker>.workers.dev/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+
+# 2. Tell the server you're ready (fire-and-forget notification)
+curl -s https://<your-worker>.workers.dev/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+
+# 3. Discover the tool
+curl -s https://<your-worker>.workers.dev/mcp \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+
+# 4. Call it
+curl -s https://<your-worker>.workers.dev/mcp \
+  -H 'content-type: application/json' \
+  -d '{
+        "jsonrpc":"2.0",
+        "id":3,
+        "method":"tools/call",
+        "params":{
+          "name":"generate_widescreen_drawing",
+          "arguments":{"prompt":"a lighthouse at sunset"}
+        }
+      }'
+```
+
+A successful `tools/call` response looks like:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [{ "type": "image", "data": "<base64 PNG>", "mimeType": "image/png" }]
+  }
+}
+```
+
+If generation itself fails (e.g. the model errors), the response is still
+`200 OK`, but `result.isError` is `true` and `result.content` carries a text
+explanation instead of an image — that's the MCP convention for a tool that
+ran but failed, as opposed to a broken request. A malformed request (unknown
+method, unknown tool name, missing `prompt`) comes back as a JSON-RPC
+`error` object, also on `200 OK`; only a request whose body isn't valid JSON
+at all gets a non-2xx (`400`) HTTP status. Client SDKs generally treat any
+non-2xx as a hard transport failure and never inspect the JSON-RPC body, so
+this distinction is what keeps ordinary tool errors visible to the caller
+instead of surfacing as an opaque connection failure.
+
+### Configuring an MCP client/session
+
+Most MCP hosts (Claude Desktop, Claude Code, other Streamable-HTTP-capable
+clients) just need the URL — they run the `initialize` → `tools/list` →
+`tools/call` sequence above automatically once connected. For example, in
+Claude Code:
+
+```bash
+claude mcp add --transport http free-flux-mcp https://<your-worker>.workers.dev/mcp
+```
+
+or in a client that takes a JSON config (e.g. `claude_desktop_config.json` /
+`.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "free-flux-mcp": {
+      "type": "http",
+      "url": "https://<your-worker>.workers.dev/mcp"
+    }
+  }
+}
+```
+
+Once connected, ask the client to draw something — it will call
+`generate_widescreen_drawing` with your prompt and receive the image back
+over the same `/mcp` endpoint.
 
 ## Caching
 

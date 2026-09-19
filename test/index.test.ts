@@ -201,4 +201,86 @@ describe("Agent Visibility template", () => {
 		const dir = await SELF.fetch(`${BASE}/.well-known/web-bot-auth/directory`);
 		expect(dir.status).toBe(404);
 	});
+
+	describe("/mcp (Streamable HTTP JSON-RPC)", () => {
+		async function rpc(body: unknown) {
+			return SELF.fetch(`${BASE}/mcp`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+			});
+		}
+
+		it("responds to initialize with server info", async () => {
+			const res = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize" });
+			expect(res.status).toBe(200);
+			const json = (await res.json()) as { result: { serverInfo: { name: string } } };
+			expect(json.result.serverInfo.name).toBe("flux-generator");
+		});
+
+		it("accepts the initialized notification with 202 and no body", async () => {
+			const res = await rpc({ jsonrpc: "2.0", method: "notifications/initialized" });
+			expect(res.status).toBe(202);
+		});
+
+		it("lists the generate_widescreen_drawing tool", async () => {
+			const res = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+			expect(res.status).toBe(200);
+			const json = (await res.json()) as { result: { tools: Array<{ name: string }> } };
+			expect(json.result.tools.map((t) => t.name)).toContain("generate_widescreen_drawing");
+		});
+
+		// Unknown methods/tools and malformed calls are JSON-RPC-level errors,
+		// not transport failures, so the HTTP status must stay 200 (except for
+		// a genuinely unparseable body) — otherwise most MCP client SDKs treat
+		// the response as a hard failure and never surface the error to the
+		// caller. See the comment above the /mcp handler.
+		it("returns a JSON-RPC error (HTTP 200) for an unknown method", async () => {
+			const res = await rpc({ jsonrpc: "2.0", id: 3, method: "not/a/real/method" });
+			expect(res.status).toBe(200);
+			const json = (await res.json()) as { error: { code: number } };
+			expect(json.error.code).toBe(-32601);
+		});
+
+		it("returns a JSON-RPC error (HTTP 200) for an unknown tool name", async () => {
+			const res = await rpc({
+				jsonrpc: "2.0",
+				id: 4,
+				method: "tools/call",
+				params: { name: "not_a_real_tool", arguments: {} },
+			});
+			expect(res.status).toBe(200);
+			const json = (await res.json()) as { error: { code: number } };
+			expect(json.error.code).toBe(-32602);
+		});
+
+		it("returns a JSON-RPC error (HTTP 200) when the prompt argument is missing", async () => {
+			const res = await rpc({
+				jsonrpc: "2.0",
+				id: 5,
+				method: "tools/call",
+				params: { name: "generate_widescreen_drawing", arguments: {} },
+			});
+			expect(res.status).toBe(200);
+			const json = (await res.json()) as { error: { code: number; message: string } };
+			expect(json.error.code).toBe(-32602);
+			expect(json.error.message).toContain("prompt");
+		});
+
+		it("returns HTTP 400 with a JSON-RPC parse error for an invalid body", async () => {
+			const res = await SELF.fetch(`${BASE}/mcp`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: "not json",
+			});
+			expect(res.status).toBe(400);
+			const json = (await res.json()) as { error: { code: number } };
+			expect(json.error.code).toBe(-32700);
+		});
+
+		it("sets CORS headers so browser-based MCP clients can call it cross-origin", async () => {
+			const res = await rpc({ jsonrpc: "2.0", id: 6, method: "tools/list" });
+			expect(res.headers.get("access-control-allow-origin")).toBe("*");
+		});
+	});
 });
