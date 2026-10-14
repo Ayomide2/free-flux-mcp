@@ -142,6 +142,8 @@ app.post("/mcp", async (c) => {
 							type: "object",
 							properties: {
 								prompt: { type: "string", description: "The core subject matter of the drawing." },
+								raw: { type: "boolean", description: "If true, send prompt raw without appending style tags." },
+								steps: { type: "number", description: "Generation steps (1-8). Defaults to 8." },
 							},
 							required: ["prompt"],
 						},
@@ -263,11 +265,16 @@ app.post("/mcp", async (c) => {
 		}
 
 		try {
-			const stylizedPrompt = `${userPrompt}, simple clean drawing style, 2D vector graphic illustration, clean solid background, non-photorealistic art`;
+			const raw = body.params?.arguments?.raw === true;
+			const isSakuga = /sakuga|pencil|line art|sketch|ink drawing|drawing paper/i.test(userPrompt);
+			const isRaw = raw || isSakuga;
+			const reqSteps = Number(body.params?.arguments?.steps);
+			const steps = Number.isFinite(reqSteps) && reqSteps > 0 ? Math.min(8, Math.round(reqSteps)) : 8;
+			const stylizedPrompt = isRaw ? userPrompt : `${userPrompt}, detailed digital illustration, dramatic cinematic lighting, rich color and texture, dynamic composition, concept-art quality, painterly digital art style, non-photorealistic`;
 
 			const aiResponse = await c.env.AI.run("@cf/black-forest-labs/flux-1-schnell", {
-				prompt: stylizedPrompt,
-				steps: 4,
+				prompt: stylizedPrompt.slice(0, 2048),
+				steps,
 			});
 
 			const base64Image = (aiResponse as { image: string }).image;
